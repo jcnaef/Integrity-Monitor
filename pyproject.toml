@@ -1,0 +1,20 @@
+[project]
+name = "final"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain>=1.2.15",
+    "langchain-google-genai>=2.1.0",
+    "langchain-openai>=0.3.0",
+    "pandas>=2.3.3",
+    "python-dotenv>=1.0",
+    "pydantic>=2.0",
+    "streamlit>=1.56.0",
+    "wbdata>=1.1.0",
+    "plotly>=6.0.0",
+    "langchain-ollama>=1.1.0",
+    "earthengine-api>=1.7.22",
+    "requests>=2.31",
+]
