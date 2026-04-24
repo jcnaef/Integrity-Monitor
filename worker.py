@@ -6,15 +6,20 @@ import logging
 # (triggered when wbdata loads and expires its persistent cache at import time)
 logging.getLogger("shelved_cache").setLevel(logging.ERROR)
 
-import itertools
 import time
 
 import pandas as pd
 
 import database as db
-from correlation_analysis import analyze_correlation
+from correlation_analysis import analyze_correlation, build_peer_change_frame
 from data_ingestion import INDICATORS, fetch_indicator, get_country_list, get_indicators_by_topic
 from llm_integrity import assess_integrity
+
+# Per-pair peer frames are expensive (one merge over ~200 countries). The
+# scheduler in `run()` processes jobs ordered by (ind1, ind2, country), so
+# caching the last-built frame covers >99% of the sequential workload
+# without growing memory. Cleared whenever the pair changes.
+_PEER_FRAME_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +89,59 @@ def _build_merged_df(
     return merged.sort_values("year").reset_index(drop=True)
 
 
+def _countries_for_pair(ind1: str, ind2: str) -> list[str]:
+    """Every country that has at least one pending/in-flight job for this
+    pair. Used to decide who's in the peer frame."""
+    with db._connect() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT country_code FROM analysis_jobs
+               WHERE indicator_1=? AND indicator_2=?""",
+            (ind1, ind2),
+        ).fetchall()
+    return [r["country_code"] for r in rows]
+
+
+def _ensure_peer_frame(ind1: str, ind2: str) -> pd.DataFrame:
+    """Return (and cache) the peer frame for a pair. On first call for a
+    new pair, drops any stale cache, prefetches both indicators for every
+    country that has a job for this pair so the peer frame is complete,
+    then builds the adjusted YoY-product frame."""
+    key = (ind1, ind2)
+    if key in _PEER_FRAME_CACHE:
+        return _PEER_FRAME_CACHE[key]
+
+    # Drop the previous pair's frame — only one pair is "active" at a time.
+    _PEER_FRAME_CACHE.clear()
+
+    countries = _countries_for_pair(ind1, ind2)
+    log.info(
+        "Peer frame for %s × %s: prefetching %d countries",
+        ind1, ind2, len(countries),
+    )
+
+    rows: list[pd.DataFrame] = []
+    for cc in countries:
+        data_1 = _fetch_and_cache(cc, ind1)
+        data_2 = _fetch_and_cache(cc, ind2)
+        merged = _build_merged_df(cc, data_1, data_2)
+        if merged is not None:
+            rows.append(merged)
+
+    if rows:
+        combined = pd.concat(rows, ignore_index=True)
+        peer_frame = build_peer_change_frame(combined)
+    else:
+        peer_frame = pd.DataFrame(columns=["country_id", "year", "change_product"])
+
+    log.info(
+        "Peer frame ready: %d countries with data, %d (country, year) rows",
+        peer_frame["country_id"].nunique() if not peer_frame.empty else 0,
+        len(peer_frame),
+    )
+    _PEER_FRAME_CACHE[key] = peer_frame
+    return peer_frame
+
+
 def _get_indicator_name(code: str) -> str:
     """Look up indicator name from DB, fall back to INDICATORS dict or code."""
     with db._connect() as conn:
@@ -130,9 +188,10 @@ def _process_job(job: dict) -> None:
         log.info("  Skipped — fewer than %d overlapping years", MIN_OVERLAPPING_YEARS)
         return
 
-    # Correlation analysis
+    # Correlation analysis with peer-year filter (Phase C)
     db.update_job_status(job_id, "analyzing")
-    result = analyze_correlation(merged)
+    peer_frame = _ensure_peer_frame(ind1, ind2)
+    result = analyze_correlation(merged, peer_frame=peer_frame)
 
     flagged = result[result["integrity_flag"]].copy()
     pearson_r = result["expected_correlation"].iloc[0] if len(result) > 0 else None
@@ -140,6 +199,8 @@ def _process_job(job: dict) -> None:
     # Store flagged items
     flagged_ids = []
     for _, row in flagged.iterrows():
+        peer_z = row.get("peer_z", float("nan"))
+        shock = row.get("global_shock_fraction", float("nan"))
         item_id = db.store_flagged_item(
             job_id=job_id,
             country_code=country,
@@ -150,6 +211,8 @@ def _process_job(job: dict) -> None:
             value_2=float(row["value_2"]),
             expected_correlation=float(row["expected_correlation"]),
             statistical_confidence=float(row["confidence_score"]),
+            peer_z=None if pd.isna(peer_z) else float(peer_z),
+            global_shock_fraction=None if pd.isna(shock) else float(shock),
         )
         flagged_ids.append(item_id)
 
@@ -190,11 +253,13 @@ def _process_job(job: dict) -> None:
     log.info("  Done — %d years, %d flagged", len(merged), len(flagged_ids))
 
 
-def seed_jobs(indicator_codes: list[str], country_codes: list[str]) -> int:
-    """Create pending jobs for all indicator pair × country combinations. Returns count."""
+def seed_jobs(pairs: list[tuple[str, str]], country_codes: list[str]) -> int:
+    """Create pending jobs for each useful pair × country. Returns count."""
     count = 0
-    pairs = list(itertools.combinations(sorted(indicator_codes), 2))
-    log.info("Seeding jobs: %d pairs × %d countries = %d jobs", len(pairs), len(country_codes), len(pairs) * len(country_codes))
+    log.info(
+        "Seeding jobs: %d useful pairs × %d countries = %d jobs",
+        len(pairs), len(country_codes), len(pairs) * len(country_codes),
+    )
     for ind1, ind2 in pairs:
         for country in country_codes:
             db.get_or_create_job(country, ind1, ind2)
@@ -206,7 +271,14 @@ def run(use_topics: bool = False, reseed: bool = False) -> None:
     """Main worker loop."""
     db.init_db()
 
-    if db.has_any_jobs() and not reseed:
+    if reseed:
+        counts = db.wipe_job_pipeline()
+        log.warning(
+            "Reseed requested — wiped pipeline: %d reviews, %d flagged_items, %d analysis_jobs",
+            counts["reviews"], counts["flagged_items"], counts["analysis_jobs"],
+        )
+
+    if db.has_any_jobs():
         log.info("Jobs already seeded — skipping indicator/country/job seeding (pass --reseed to force)")
     else:
         if use_topics:
@@ -217,23 +289,25 @@ def run(use_topics: bool = False, reseed: bool = False) -> None:
                 db.upsert_indicators(topic_indicators, topic="Economy & Growth")
             except Exception as e:
                 log.warning("Topic discovery failed, using hardcoded indicators: %s", e)
-                topic_indicators = {}
             db.upsert_indicators(INDICATORS, topic="Hardcoded")
-            all_indicators = list({**topic_indicators, **INDICATORS}.keys())
         else:
             db.upsert_indicators(INDICATORS, topic="Hardcoded")
-            all_indicators = list(INDICATORS.keys())
 
-        log.info("Total indicators: %d", len(all_indicators))
+        # Pair selection: only run jobs for pairs that pair_discovery validated.
+        pairs = db.get_useful_pairs()
+        if not pairs:
+            log.error(
+                "useful_pairs is empty — run `uv run python pair_discovery.py` "
+                "before starting the worker. Skipping job seeding."
+            )
+            return
 
-        # Get countries
         log.info("Fetching country list...")
         countries = get_country_list()
         country_codes = list(countries.keys())
         log.info("Found %d countries", len(country_codes))
 
-        # Seed jobs
-        seed_jobs(all_indicators, country_codes)
+        seed_jobs(pairs, country_codes)
 
     # Main loop
     log.info("Starting main loop...")

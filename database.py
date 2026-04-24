@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS flagged_items (
     value_2                REAL NOT NULL,
     expected_correlation   REAL NOT NULL,
     statistical_confidence REAL NOT NULL,
+    peer_z                 REAL,
+    global_shock_fraction  REAL,
     llm_is_anomaly         INTEGER,
     llm_confidence         REAL,
     llm_explanation        TEXT,
@@ -88,6 +90,16 @@ CREATE TABLE IF NOT EXISTS regime_data (
 );
 CREATE INDEX IF NOT EXISTS ix_regime_country_year
     ON regime_data (country_code, year);
+
+CREATE TABLE IF NOT EXISTS useful_pairs (
+    indicator_1   TEXT NOT NULL,
+    indicator_2   TEXT NOT NULL,
+    global_r      REAL NOT NULL,
+    support_count INTEGER NOT NULL,
+    panel_size    INTEGER NOT NULL,
+    discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (indicator_1, indicator_2)
+);
 """
 
 REGIME_LABELS = {
@@ -113,6 +125,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE indicators ADD COLUMN status TEXT NOT NULL DEFAULT 'useful'"
         )
+
+    flagged_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(flagged_items)").fetchall()
+    }
+    if "peer_z" not in flagged_cols:
+        conn.execute("ALTER TABLE flagged_items ADD COLUMN peer_z REAL")
+    if "global_shock_fraction" not in flagged_cols:
+        conn.execute("ALTER TABLE flagged_items ADD COLUMN global_shock_fraction REAL")
 
 
 def init_db(db_path: Path = DEFAULT_DB) -> None:
@@ -344,6 +364,8 @@ def store_flagged_item(
     value_2: float,
     expected_correlation: float,
     statistical_confidence: float,
+    peer_z: float | None = None,
+    global_shock_fraction: float | None = None,
     db_path: Path = DEFAULT_DB,
 ) -> int:
     """Insert a flagged data point. Returns the new row id."""
@@ -351,11 +373,13 @@ def store_flagged_item(
         cur = conn.execute(
             """INSERT INTO flagged_items
                (job_id, country_code, indicator_1, indicator_2, year,
-                value_1, value_2, expected_correlation, statistical_confidence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                value_1, value_2, expected_correlation, statistical_confidence,
+                peer_z, global_shock_fraction)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT DO NOTHING""",
             (job_id, country_code, indicator_1, indicator_2, year,
-             value_1, value_2, expected_correlation, statistical_confidence),
+             value_1, value_2, expected_correlation, statistical_confidence,
+             peer_z, global_shock_fraction),
         )
         if cur.lastrowid:
             return cur.lastrowid
@@ -384,24 +408,51 @@ def update_flagged_item_assessment(
         )
 
 
-def get_unreviewed_items(
-    db_path: Path = DEFAULT_DB,
+# Active-learning priority score computed in SQL. Expression is shared
+# between get_unreviewed_items (for ORDER BY + as a returned column) and
+# the count helper (so "N of M" shown in the dashboard is consistent).
+#
+# Rewards, in order:
+#   1.0  LLM/stats disagreement (flags worth a human eye)
+#   ≤0.5 LLM uncertainty — peaks at llm_confidence = 0.5
+#   ≤0.3 peer-unique move (low global_shock_fraction)
+_PRIORITY_EXPR = """(
+    CASE
+        WHEN (f.llm_is_anomaly = 1 AND f.statistical_confidence < 0.5)
+          OR (f.llm_is_anomaly = 0 AND f.statistical_confidence >= 0.7)
+            THEN 1.0
+        ELSE 0.0
+    END
+    + 0.5 * (1.0 - ABS(COALESCE(f.llm_confidence, 0.5) - 0.5) * 2)
+    + 0.3 * (1.0 - COALESCE(f.global_shock_fraction, 0.0))
+)"""
+
+# "High-value" = NOT (LLM assessed AND LLM agrees with stats direction AND
+# both are confident). Unassessed items (NULL llm_is_anomaly) are always
+# considered high-value so they reach the reviewer.
+_HIGH_VALUE_FILTER = """NOT (
+    f.llm_is_anomaly IS NOT NULL
+    AND f.llm_is_anomaly = CASE
+        WHEN f.statistical_confidence >= 0.7 THEN 1 ELSE 0 END
+    AND f.llm_confidence >= 0.85
+    AND f.statistical_confidence >= 0.85
+)"""
+
+
+def _build_review_filters(
     *,
-    country_codes: list[str] | None = None,
-    indicator_pairs: list[tuple[str, str]] | None = None,
-    min_confidence: float | None = None,
-    show_reviewed: bool = False,
-    limit: int = 10,
-    offset: int = 0,
-) -> list[dict]:
-    """Return flagged items for the review queue with optional filters."""
-    conditions = []
+    country_codes: list[str] | None,
+    indicator_pairs: list[tuple[str, str]] | None,
+    min_confidence: float | None,
+    show_reviewed: bool,
+    high_value_only: bool,
+) -> tuple[list[str], list]:
+    """Assemble WHERE-clause fragments and params for the review queries."""
+    conditions: list[str] = []
     params: list = []
 
     if not show_reviewed:
-        conditions.append(
-            "f.id NOT IN (SELECT flagged_item_id FROM reviews)"
-        )
+        conditions.append("f.id NOT IN (SELECT flagged_item_id FROM reviews)")
 
     if country_codes:
         placeholders = ",".join("?" * len(country_codes))
@@ -419,6 +470,37 @@ def get_unreviewed_items(
         conditions.append("f.llm_confidence >= ?")
         params.append(min_confidence)
 
+    if high_value_only:
+        conditions.append(_HIGH_VALUE_FILTER)
+
+    return conditions, params
+
+
+def get_unreviewed_items(
+    db_path: Path = DEFAULT_DB,
+    *,
+    country_codes: list[str] | None = None,
+    indicator_pairs: list[tuple[str, str]] | None = None,
+    min_confidence: float | None = None,
+    show_reviewed: bool = False,
+    high_value_only: bool = True,
+    limit: int = 10,
+    offset: int = 0,
+) -> list[dict]:
+    """Return flagged items for the review queue ordered by active-learning
+    priority (see ``_PRIORITY_EXPR``).
+
+    ``high_value_only`` (default True) hides flags where the LLM and the
+    statistical detector already agree at high confidence — those don't
+    need human attention.
+    """
+    conditions, params = _build_review_filters(
+        country_codes=country_codes,
+        indicator_pairs=indicator_pairs,
+        min_confidence=min_confidence,
+        show_reviewed=show_reviewed,
+        high_value_only=high_value_only,
+    )
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
     with _connect(db_path) as conn:
@@ -427,24 +509,43 @@ def get_unreviewed_items(
                        i1.name AS indicator_1_name,
                        i2.name AS indicator_2_name,
                        r.status AS review_status,
-                       r.note AS review_note
+                       r.note AS review_note,
+                       {_PRIORITY_EXPR} AS priority
                 FROM flagged_items f
                 LEFT JOIN indicators i1 ON f.indicator_1 = i1.code
                 LEFT JOIN indicators i2 ON f.indicator_2 = i2.code
                 LEFT JOIN reviews r ON f.id = r.flagged_item_id
                 {where}
-                ORDER BY f.statistical_confidence DESC, f.id
+                ORDER BY priority DESC, f.statistical_confidence DESC, f.id
                 LIMIT ? OFFSET ?""",
             params + [limit, offset],
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_unreviewed_count(db_path: Path = DEFAULT_DB) -> int:
-    """Return the number of flagged items that haven't been reviewed."""
+def get_unreviewed_count(
+    db_path: Path = DEFAULT_DB,
+    *,
+    country_codes: list[str] | None = None,
+    indicator_pairs: list[tuple[str, str]] | None = None,
+    min_confidence: float | None = None,
+    high_value_only: bool = False,
+) -> int:
+    """Count unreviewed items, optionally honoring the same filters the
+    review queue uses. ``high_value_only=False`` (default) returns the raw
+    queue size — matches the dashboard's "showing X of Y" denominator."""
+    conditions, params = _build_review_filters(
+        country_codes=country_codes,
+        indicator_pairs=indicator_pairs,
+        min_confidence=min_confidence,
+        show_reviewed=False,
+        high_value_only=high_value_only,
+    )
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
     with _connect(db_path) as conn:
         row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM flagged_items WHERE id NOT IN (SELECT flagged_item_id FROM reviews)"
+            f"SELECT COUNT(*) AS cnt FROM flagged_items f {where}",
+            params,
         ).fetchone()
         return row["cnt"]
 
@@ -612,6 +713,77 @@ def regime_row_count(db_path: Path = DEFAULT_DB) -> int:
         return row["cnt"]
 
 
+# ── Useful Pairs ───────────────────────────────────────────────────────
+
+
+def upsert_useful_pair(
+    indicator_1: str,
+    indicator_2: str,
+    global_r: float,
+    support_count: int,
+    panel_size: int,
+    db_path: Path = DEFAULT_DB,
+) -> None:
+    """Record a pair that passed discovery. Stores with indicators sorted so
+    (ind1, ind2) matches the canonical order used when seeding jobs."""
+    a, b = sorted([indicator_1, indicator_2])
+    with _connect(db_path) as conn:
+        conn.execute(
+            """INSERT INTO useful_pairs
+                 (indicator_1, indicator_2, global_r, support_count, panel_size, discovered_at)
+               VALUES (?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(indicator_1, indicator_2) DO UPDATE SET
+                 global_r=excluded.global_r,
+                 support_count=excluded.support_count,
+                 panel_size=excluded.panel_size,
+                 discovered_at=excluded.discovered_at""",
+            (a, b, float(global_r), int(support_count), int(panel_size)),
+        )
+
+
+def get_useful_pairs(db_path: Path = DEFAULT_DB) -> list[tuple[str, str]]:
+    """Return list of (indicator_1, indicator_2) tuples that passed discovery."""
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT indicator_1, indicator_2 FROM useful_pairs "
+            "ORDER BY ABS(global_r) DESC"
+        ).fetchall()
+        return [(r["indicator_1"], r["indicator_2"]) for r in rows]
+
+
+def get_useful_pairs_detailed(db_path: Path = DEFAULT_DB) -> list[dict]:
+    """Return full useful_pairs rows — for CLI display and dashboards."""
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM useful_pairs ORDER BY ABS(global_r) DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def clear_useful_pairs(db_path: Path = DEFAULT_DB) -> int:
+    """Wipe the useful_pairs table. Returns number of rows removed."""
+    with _connect(db_path) as conn:
+        before = conn.execute("SELECT COUNT(*) FROM useful_pairs").fetchone()[0]
+        conn.execute("DELETE FROM useful_pairs")
+        return before
+
+
+def wipe_job_pipeline(db_path: Path = DEFAULT_DB) -> dict:
+    """Drop all queued work and human feedback. Used by ``worker.py --reseed``
+    when the pair catalog changes and the old flags/reviews no longer map to
+    current pairs. Returns row counts removed per table."""
+    with _connect(db_path) as conn:
+        counts = {
+            "reviews": conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0],
+            "flagged_items": conn.execute("SELECT COUNT(*) FROM flagged_items").fetchone()[0],
+            "analysis_jobs": conn.execute("SELECT COUNT(*) FROM analysis_jobs").fetchone()[0],
+        }
+        conn.execute("DELETE FROM reviews")
+        conn.execute("DELETE FROM flagged_items")
+        conn.execute("DELETE FROM analysis_jobs")
+    return counts
+
+
 # ── Standalone test ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -640,19 +812,28 @@ if __name__ == "__main__":
     update_job_status(job_id, "done", db_path=tmp, pearson_r=0.85, total_years=10, flagged_count=2)
     assert get_next_pending_job(db_path=tmp) is None  # no more pending
 
-    # Flagged items
+    # Flagged items (with Phase C peer fields)
     item_id = store_flagged_item(
         job_id, "USA", "NY.GDP.MKTP.KD.ZG", "FP.CPI.TOTL.ZG",
-        2020, 2.3, 3.1, 0.85, 0.92, db_path=tmp,
+        2020, 2.3, 3.1, 0.85, 0.92,
+        peer_z=1.7, global_shock_fraction=0.3,
+        db_path=tmp,
     )
     print(f"Flagged item: {item_id}")
     update_flagged_item_assessment(item_id, True, 0.88, "Likely anomaly", db_path=tmp)
+    # Default high_value_only filter hides this (LLM + stats agree at high confidence).
+    assert get_unreviewed_items(db_path=tmp) == []
+    items = get_unreviewed_items(db_path=tmp, high_value_only=False)
+    assert items[0]["peer_z"] == 1.7 and items[0]["global_shock_fraction"] == 0.3
+    assert "priority" in items[0]
 
-    # Review queue
-    items = get_unreviewed_items(db_path=tmp)
+    # Review queue (items present under high_value_only=False; hidden by default)
+    items = get_unreviewed_items(db_path=tmp, high_value_only=False)
     assert len(items) == 1
     assert items[0]["llm_explanation"] == "Likely anomaly"
-    assert get_unreviewed_count(db_path=tmp) == 1
+    assert get_unreviewed_count(db_path=tmp) == 1  # raw count
+    # Same item hidden under high-value filter (LLM and stats agree, both confident).
+    assert get_unreviewed_count(db_path=tmp, high_value_only=True) == 0
 
     # Review
     submit_review(item_id, "validated", "Confirmed issue", db_path=tmp)
@@ -690,6 +871,26 @@ if __name__ == "__main__":
     # Unknown country → None
     assert get_regime_with_fallback("ZZZ", 2020, db_path=tmp) is None
     assert regime_row_count(db_path=tmp) == 3
+
+    # Useful pairs
+    upsert_useful_pair("NY.GDP.MKTP.CD", "EG.USE.ELEC.KH.PC", 0.78, 22, 30, db_path=tmp)
+    upsert_useful_pair("FP.CPI.TOTL.ZG", "FM.LBL.BMNY.ZG", 0.55, 19, 30, db_path=tmp)
+    # Sort-order canonicalization: inserting reversed pair updates same row.
+    upsert_useful_pair("EG.USE.ELEC.KH.PC", "NY.GDP.MKTP.CD", 0.80, 23, 30, db_path=tmp)
+    pairs = get_useful_pairs(db_path=tmp)
+    assert len(pairs) == 2, f"expected 2 pairs, got {pairs}"
+    assert all(a < b for a, b in pairs), "pairs should be stored sorted"
+    detailed = get_useful_pairs_detailed(db_path=tmp)
+    assert detailed[0]["global_r"] == 0.80  # updated value won
+    removed = clear_useful_pairs(db_path=tmp)
+    assert removed == 2 and get_useful_pairs(db_path=tmp) == []
+
+    # Pipeline wipe — 1 review, 1 flagged item, 1 job from earlier in the test.
+    counts = wipe_job_pipeline(db_path=tmp)
+    assert counts == {"reviews": 1, "flagged_items": 1, "analysis_jobs": 1}, counts
+    assert get_unreviewed_count(db_path=tmp) == 0
+    counts_again = wipe_job_pipeline(db_path=tmp)
+    assert counts_again == {"reviews": 0, "flagged_items": 0, "analysis_jobs": 0}
 
     tmp.unlink()
     print("\nAll tests passed!")
